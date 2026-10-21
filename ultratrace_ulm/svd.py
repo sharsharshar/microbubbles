@@ -32,6 +32,61 @@ def doppler_velocity_to_freq(
     return 2.0 * (velocity_mm_s * 1e-3) * tx_freq_hz / speed_of_sound_m_s
 
 
+# Voxel columns per block when forming the Gram matrix and projecting. Bounds the
+# complex128 working set to a few hundred MB; promoting the whole (frames, voxels)
+# matrix at once needs ~12 GB per acquisition at the reference grid size.
+_VOXEL_BLOCK = 32768
+
+
+def _gram(matrix: np.ndarray, block: int = _VOXEL_BLOCK) -> np.ndarray:
+    """(frames, frames) complex128 Gram matrix M M^H, accumulated over voxel blocks."""
+    n_frames = int(matrix.shape[0])
+    cov = np.zeros((n_frames, n_frames), dtype=np.complex128)
+    for v0 in range(0, matrix.shape[1], block):
+        m = np.asarray(matrix[:, v0 : v0 + block], dtype=np.complex128)
+        cov += m @ m.conj().T
+    return cov
+
+
+def _project(
+    matrix: np.ndarray,
+    uc: np.ndarray,
+    magnitude: bool,
+    block: int = _VOXEL_BLOCK,
+) -> np.ndarray:
+    """uc uc^H M per voxel block, rounded to complex64 (or its float32 magnitude)."""
+    out = np.empty(matrix.shape, dtype=np.float32 if magnitude else np.complex64)
+    uch = uc.conj().T
+    for v0 in range(0, matrix.shape[1], block):
+        m = np.asarray(matrix[:, v0 : v0 + block], dtype=np.complex128)
+        filtered = (uc @ (uch @ m)).astype(np.complex64)
+        out[:, v0 : v0 + block] = np.abs(filtered) if magnitude else filtered
+    return out
+
+
+def _centroid_cutoff_from_gram(
+    cov: np.ndarray,
+    frame_rate_hz: float,
+    tissue_freq_hz: float,
+) -> int:
+    n_frames = int(cov.shape[0])
+    # Mean-subtracting each voxel's time series is X = J M with J = I - 11^T/n,
+    # so X X^H = J (M M^H) J: the centered Gram needs no second pass over M.
+    j = np.eye(n_frames) - 1.0 / n_frames
+    evals, u = np.linalg.eigh(j @ cov @ j)
+    u = u[:, np.argsort(evals)[::-1]]
+    abs_freqs = np.abs(np.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz))
+    centroid = np.zeros(n_frames)
+    for i in range(n_frames):
+        power = np.abs(np.fft.fft(u[:, i])) ** 2
+        power[0] = 0.0  # exclude DC
+        total = power.sum()
+        if total > 0:
+            centroid[i] = float(np.sum(abs_freqs * power) / total)
+    above = np.where(centroid > tissue_freq_hz)[0]
+    return int(above[0]) if len(above) else max(1, round(n_frames * 0.1))
+
+
 def spectral_centroid_cutoff(
     matrix: np.ndarray,
     frame_rate_hz: float,
@@ -57,22 +112,83 @@ def spectral_centroid_cutoff(
     data. Folding powers -- not amplitudes -- also keeps +f and -f Doppler
     from cancelling.
     """
+    return _centroid_cutoff_from_gram(_gram(matrix), frame_rate_hz, tissue_freq_hz)
+
+
+def _filter_matrix(
+    matrix: np.ndarray,
+    low_cutoff: float,
+    high_cutoff: float | None,
+    method: str,
+    n_components: int | None,
+    frame_rate_hz: float | None,
+    tissue_freq_hz: float,
+    magnitude: bool,
+) -> np.ndarray:
+    """Clutter-filter a (frames, voxels) matrix -> complex64, or float32 magnitude."""
     n_frames = int(matrix.shape[0])
-    x = np.asarray(matrix, dtype=np.complex128)
-    x = x - x.mean(axis=0, keepdims=True)
-    cov = x @ x.conj().T
-    evals, u = np.linalg.eigh(cov)
-    u = u[:, np.argsort(evals)[::-1]]
-    abs_freqs = np.abs(np.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz))
-    centroid = np.zeros(n_frames)
-    for i in range(n_frames):
-        power = np.abs(np.fft.fft(u[:, i])) ** 2
-        power[0] = 0.0  # exclude DC
-        total = power.sum()
-        if total > 0:
-            centroid[i] = float(np.sum(abs_freqs * power) / total)
-    above = np.where(centroid > tissue_freq_hz)[0]
-    return int(above[0]) if len(above) else max(1, round(n_frames * 0.1))
+    cov = None
+
+    if method == "adaptive":
+        if frame_rate_hz is None:
+            raise ValueError(
+                "method='adaptive' requires frame_rate_hz. Pass --frame-rate, or "
+                "re-beamform from a neutral file that records the frame rate (or "
+                "its pulse repetition rate and angle count) in /config."
+            )
+        # One Gram matrix serves both the cutoff choice and the projection.
+        cov = _gram(matrix)
+        low = _centroid_cutoff_from_gram(cov, frame_rate_hz, tissue_freq_hz)
+        normalized_method = "fast"
+    else:
+        low = int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
+        normalized_method = "fast" if method in {"gpu", "gpu_full", "randomized"} else method
+
+    high = 1.0 if high_cutoff is None else float(high_cutoff)
+    high_remove = max(0, min(n_frames, int(round((1.0 - high) * n_frames))))
+    if low + high_remove >= n_frames:
+        raise ValueError(
+            f"SVD cutoff removes all components: low={low}, high={high_cutoff}"
+        )
+
+    if normalized_method == "none":
+        filtered = matrix
+    elif normalized_method == "fast":
+        # Double precision: the complex64 Gram matrix has near-degenerate
+        # eigenvalues whose eigenvectors vary run-to-run, which shifts the
+        # filtered magnitude and makes detections non-deterministic.
+        if cov is None:
+            cov = _gram(matrix)
+        evals, u = np.linalg.eigh(cov)
+        u = u[:, np.argsort(evals)[::-1]]
+        stop = n_frames - high_remove if high_remove > 0 else n_frames
+        uc = u[:, low:stop]
+        return _project(matrix, uc, magnitude)
+    elif normalized_method == "full":
+        m = np.asarray(matrix, dtype=np.complex128)
+        u, s, vh = np.linalg.svd(m, full_matrices=False)
+        s[:low] = 0
+        if high_remove > 0:
+            s[-high_remove:] = 0
+        filtered = (u * s[None, :]) @ vh
+    else:
+        raise ValueError(f"Unsupported SVD method: {method}")
+
+    filtered = filtered.astype(np.complex64, copy=False)
+    return np.abs(filtered) if magnitude else filtered
+
+
+def _as_matrix(data: np.ndarray) -> tuple[np.ndarray, tuple[int, ...], bool]:
+    """(frames, voxels) complex64 view of 3D/4D compound data, its spatial shape, squeeze flag."""
+    if data.ndim == 3:
+        data = data[:, None, :, :]
+        squeeze = True
+    elif data.ndim == 4:
+        squeeze = False
+    else:
+        raise ValueError(f"Expected 3D or 4D compound data, got shape {data.shape}")
+    n_frames = int(data.shape[0])
+    return np.asarray(data, dtype=np.complex64).reshape(n_frames, -1), data.shape[1:], squeeze
 
 
 def filter_svd_3d(
@@ -92,65 +208,13 @@ def filter_svd_3d(
     is the numerically stable SVD. Both decompositions run in double precision
     (complex128) so the result is deterministic across runs.
     """
-    if data.ndim == 3:
-        data = data[:, None, :, :]
-        squeeze = True
-    elif data.ndim == 4:
-        squeeze = False
-    else:
-        raise ValueError(f"Expected 3D or 4D compound data, got shape {data.shape}")
-
-    n_frames = int(data.shape[0])
-    spatial_shape = data.shape[1:]
-    matrix = np.asarray(data, dtype=np.complex64).reshape(n_frames, -1)
-
-    if method == "adaptive":
-        if frame_rate_hz is None:
-            raise ValueError(
-                "method='adaptive' requires frame_rate_hz. Pass --frame-rate, or "
-                "re-beamform from a neutral file that records the frame rate (or "
-                "its pulse repetition rate and angle count) in /config."
-            )
-        low = spectral_centroid_cutoff(matrix, frame_rate_hz, tissue_freq_hz)
-        normalized_method = "fast"
-    else:
-        low = int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
-        normalized_method = "fast" if method in {"gpu", "gpu_full", "randomized"} else method
-
-    high = 1.0 if high_cutoff is None else float(high_cutoff)
-    high_remove = max(0, min(n_frames, int(round((1.0 - high) * n_frames))))
-    if low + high_remove >= n_frames:
-        raise ValueError(
-            f"SVD cutoff removes all components: low={low}, high={high_cutoff}"
-        )
-
-    if normalized_method == "none":
-        filtered = matrix
-    elif normalized_method == "fast":
-        # Double precision: the complex64 Gram matrix has near-degenerate
-        # eigenvalues whose eigenvectors vary run-to-run, which shifts the
-        # filtered magnitude and makes detections non-deterministic.
-        m = np.asarray(matrix, dtype=np.complex128)
-        cov = m @ m.conj().T
-        evals, u = np.linalg.eigh(cov)
-        u = u[:, np.argsort(evals)[::-1]]
-        stop = n_frames - high_remove if high_remove > 0 else n_frames
-        uc = u[:, low:stop]
-        filtered = uc @ (uc.conj().T @ m)
-    elif normalized_method == "full":
-        m = np.asarray(matrix, dtype=np.complex128)
-        u, s, vh = np.linalg.svd(m, full_matrices=False)
-        s[:low] = 0
-        if high_remove > 0:
-            s[-high_remove:] = 0
-        filtered = (u * s[None, :]) @ vh
-    else:
-        raise ValueError(f"Unsupported SVD method: {method}")
-
-    out = filtered.reshape((n_frames, *spatial_shape))
-    if squeeze:
-        out = out[:, 0]
-    return out.astype(np.complex64, copy=False)
+    matrix, spatial_shape, squeeze = _as_matrix(data)
+    filtered = _filter_matrix(
+        matrix, low_cutoff, high_cutoff, method, n_components,
+        frame_rate_hz, tissue_freq_hz, magnitude=False,
+    )
+    out = filtered.reshape((matrix.shape[0], *spatial_shape))
+    return out[:, 0] if squeeze else out
 
 
 def filtered_magnitude(
@@ -163,16 +227,14 @@ def filtered_magnitude(
     frame_rate_hz: float | None = None,
     tissue_freq_hz: float = 100.0,
 ) -> np.ndarray:
-    filtered = filter_svd_3d(
-        compound,
-        low_cutoff=low_cutoff,
-        high_cutoff=high_cutoff,
-        method=method,
-        n_components=n_components,
-        frame_rate_hz=frame_rate_hz,
-        tissue_freq_hz=tissue_freq_hz,
-    )
-    magnitude = np.abs(filtered).astype(np.float32, copy=False)
+    # Straight to float32 magnitude: never materializes the complex64 result.
+    matrix, spatial_shape, squeeze = _as_matrix(compound)
+    magnitude = _filter_matrix(
+        matrix, low_cutoff, high_cutoff, method, n_components,
+        frame_rate_hz, tissue_freq_hz, magnitude=True,
+    ).reshape((matrix.shape[0], *spatial_shape))
+    if squeeze:
+        magnitude = magnitude[:, 0]
     if temporal_sigma > 0:
         magnitude = gaussian_filter1d(magnitude, sigma=temporal_sigma, axis=0)
     return magnitude
