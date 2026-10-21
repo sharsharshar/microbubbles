@@ -79,10 +79,30 @@ def _grids(data: dict, h5_path: Path | None):
         return grid_arrays(h5, acq)
 
 
-def _raw_offset(dset: h5py.Dataset) -> int | None:
-    """File offset of a (frames, elev, z, x) dataset stored as plain C-order
-    little-endian complex64 (contiguous, unfiltered, internal), else None."""
-    if dset.ndim != 4 or dset.dtype != np.dtype("<c8") or dset.chunks is not None or dset.external:
+def _is_plain_complex64(stored: h5py.h5t.TypeID) -> bool:
+    """Whether the stored type's bytes are packed little-endian float32 (real, imag)
+    pairs: h5py's own complex64 compound, or HDF5 2's native complex type."""
+    if stored.equal(h5py.h5t.py_create(np.dtype("<c8"))):
+        return True
+    native = getattr(h5py.h5t, "COMPLEX_IEEE_F32LE", None)
+    return native is not None and stored.equal(native)
+
+
+def _raw_offset(dset: h5py.Dataset, h5: h5py.File) -> int | None:
+    """Byte offset of ``dset`` in ``h5``'s file when its raw bytes there are exactly
+    what h5py would return as a (frames, elev, z, x) complex64 array, else None.
+
+    Each check rules out a layout where reading at get_offset() would not match
+    h5py: a dataset reached through an external link lives in another file;
+    chunked, compact or external-storage data is not one run of bytes; h5py
+    reports padded or non-IEEE {r, i} compounds as complex64 although their bytes
+    differ; unallocated storage reads as fill values; os.pread is Unix-only.
+    """
+    if not hasattr(os, "pread") or dset.ndim != 4 or dset.file != h5:
+        return None
+    if dset.chunks is not None or dset.external or not _is_plain_complex64(dset.id.get_type()):
+        return None
+    if dset.id.get_storage_size() != dset.nbytes:
         return None
     offset = dset.id.get_offset()
     return None if offset is None else int(offset)
@@ -92,11 +112,13 @@ def _interp_bounds(coord: float, n: int) -> tuple[int, int]:
     """Index range [lo, hi) holding every voxel that order-1, mode="nearest"
     interpolation at ``coord`` reads, plus a voxel of margin either side.
 
-    The block reaches the array edge exactly where the interpolation clamps, so
-    interpolating on it gives the full-array value. A non-finite coordinate
-    takes the whole axis, leaving whatever map_coordinates does with it unchanged.
+    mode="nearest" maps out-of-range taps to the edge voxel, so a block that
+    reaches the array edge wherever the taps pass it gives the full-array value.
+    scipy takes floor(coord) as a 64-bit integer, so for non-finite coordinates
+    and beyond +-2**63 the taps are arbitrary: take the whole axis there, which
+    reproduces whatever map_coordinates does on the full frame.
     """
-    if not np.isfinite(coord):
+    if not np.isfinite(coord) or abs(coord) >= 2.0**63:
         return 0, n
     base = int(np.floor(min(max(coord, 0.0), n - 1.0)))
     return max(0, base - 1), min(n, base + 3)
@@ -150,6 +172,9 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
     all_intensities = [np.ones(len(s), dtype=np.float32) for s in all_speeds]
 
     with open_h5(h5_path) as h5, open(Path(h5_path).expanduser().resolve(), "rb", buffering=0) as raw:
+        # Read-write intent on a read-only open means a writer in this process
+        # shares the file and may still hold writes in HDF5's buffers.
+        shared_with_writer = bool(h5.id.get_intent() & h5py.h5f.ACC_RDWR)
         all_acq_ids = acq_keys(h5)
         n_h5_acqs = len(all_acq_ids)
         if selected_acq_ids:
@@ -193,9 +218,18 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
                 points.append((ti, pi, gframe - acq_start, np.array([[elev_idx], [z_idx], [x_idx]])))
 
             dset = compound_dataset(h5, acq_id)  # (frames, elev, z, x)
-            offset = None if svd_cutoff > 0 else _raw_offset(dset)
-            if offset is not None:
-                # Raw magnitude needs only a few voxels per point, not the whole
+            offset = None if svd_cutoff > 0 else _raw_offset(dset, h5)
+            # Each point reads up to 4 elevation planes x 4 rows. Scattered row
+            # reads cost more per byte than one sequential read, and on the
+            # reference grid the cold-cache times cross near half the dataset's
+            # size (about 30k points per acquisition): past that, read it whole.
+            sparse_bytes = len(points) * 16 * dset.shape[-1] * dset.dtype.itemsize
+            if offset is not None and sparse_bytes < dset.nbytes // 2:
+                if shared_with_writer:
+                    # HDF5 keeps a dataset's buffered writes with the open dataset,
+                    # so flush now that this handle has it open, before raw reads.
+                    h5.flush()
+                # Raw magnitude needs a few rows per point, not the whole
                 # acquisition (~2 GB each, so a full pass re-reads the entire file).
                 values = _sample_raw_points(
                     raw.fileno(), offset, dset.shape, [(fia, coords) for _, _, fia, coords in points]
