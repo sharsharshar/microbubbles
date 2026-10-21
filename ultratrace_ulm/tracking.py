@@ -21,7 +21,11 @@ from .runtime import dump_pickle, load_pickle, thread_map
 from .svd import doppler_velocity_to_freq, filtered_magnitude
 
 # Frames per task when frame-independent filters are spread over threads. Small
-# blocks balance across the hybrid P/E cores and bound per-task temporaries.
+# blocks balance across the hybrid P/E cores and bound per-task temporaries
+# (about 30 MB per in-flight block on the reference grid). glibc keeps freed
+# blocks in per-thread arenas for the next acquisition: measured 470 MiB with
+# 16 threads and 280 MiB with 8, but 8 threads detect 20% slower, so the pools
+# stay at the CPU count.
 _FRAME_BLOCK = 4
 
 
