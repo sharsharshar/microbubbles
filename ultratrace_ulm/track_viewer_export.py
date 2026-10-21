@@ -120,6 +120,9 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
                 continue
 
             compound_raw = np.asarray(compound_dataset(h5, acq_id))  # (frames, elev, z, x)
+            if compound_raw.ndim == 3:
+                # (frames, z, x) is one elevation plane, as tracking reads it.
+                compound_raw = compound_raw[:, None]
             if svd_cutoff > 0:
                 # Stable full SVD: the covariance ("fast") variant is numerically
                 # unstable in float32 and not reproducible across backends.
