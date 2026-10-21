@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from functools import partial
 from math import ceil
 from pathlib import Path
 
@@ -13,8 +16,12 @@ from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates, m
 from scipy.optimize import linear_sum_assignment
 
 from .h5_io import acq_keys, grid_arrays, load_compound, open_h5, select_acquisitions
-from .runtime import dump_pickle, load_pickle
+from .runtime import dump_pickle, load_pickle, thread_map
 from .svd import doppler_velocity_to_freq, filtered_magnitude
+
+# Frames per task when frame-independent filters are spread over threads. Small
+# blocks balance across the hybrid P/E cores and bound per-task temporaries.
+_FRAME_BLOCK = 4
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,24 @@ def indices_to_mm(
     return np.stack([x, y, z], axis=1).astype(np.float32, copy=False)
 
 
+def _per_frame_blocks(
+    filter_fn: Callable[..., object], volume: np.ndarray, block: int = _FRAME_BLOCK
+) -> np.ndarray:
+    """Run an ndimage filter that never mixes frames over frame blocks in threads.
+
+    scipy.ndimage filters are single-threaded but release the GIL; with a zero
+    sigma / unit size along the frame axis the result is identical to filtering
+    the whole volume at once.
+    """
+    out = np.empty_like(volume)
+
+    def run(f0: int) -> None:
+        filter_fn(volume[f0 : f0 + block], output=out[f0 : f0 + block])
+
+    thread_map(run, range(0, volume.shape[0], block))
+    return out
+
+
 def _slice_stats(volume: np.ndarray, smoothing_sigma: float) -> tuple[np.ndarray, np.ndarray]:
     data = np.asarray(volume, dtype=np.float32)
     if smoothing_sigma > 0:
@@ -146,13 +171,18 @@ def _slice_stats(volume: np.ndarray, smoothing_sigma: float) -> tuple[np.ndarray
     n_elev = data.shape[1]
     means = np.zeros(n_elev, dtype=np.float32)
     stds = np.ones(n_elev, dtype=np.float32)
-    for elev in range(n_elev):
+
+    def plane_stats(elev: int) -> None:
         values = data[:, elev]
-        mask = values > 0
-        if np.any(mask):
-            means[elev] = float(values[mask].mean())
-            std = float(values[mask].std())
+        positive = values[values > 0]  # one masked copy serves both moments
+        if positive.size:
+            means[elev] = float(positive.mean())
+            std = float(positive.std())
             stds[elev] = std if std > 1e-10 else 1.0
+
+    # Planes are independent; each worker holds one plane's mask and copy, so
+    # cap the pool to bound that memory.
+    thread_map(plane_stats, range(n_elev), max_workers=min(8, os.cpu_count() or 1))
     return means, stds
 
 
@@ -167,22 +197,36 @@ def detect_batch(
 
     smoothed = np.asarray(volume, dtype=np.float32)
     if smoothing_sigma > 0:
-        smoothed = gaussian_filter(smoothed, sigma=(0, 0, smoothing_sigma, smoothing_sigma))
+        smoothed = _per_frame_blocks(
+            partial(gaussian_filter, sigma=(0, 0, smoothing_sigma, smoothing_sigma)), smoothed
+        )
     # Stats on the already-smoothed volume (sigma 0) rather than smoothing again.
     means, stds = _slice_stats(smoothed, 0.0)
     # z-score in place: the smoothed copy is not needed afterwards. np.asarray
     # can return a view of the caller's memory (memmap, masked array, other
     # subclasses, __array__ objects), so test for sharing, not identity.
     zscore = smoothed.copy() if np.may_share_memory(smoothed, volume) else smoothed
-    zscore -= means[None, :, None, None]
-    zscore /= stds[None, :, None, None] + 1e-10
-
+    mean_b = means[None, :, None, None]
+    std_b = stds[None, :, None, None] + 1e-10
     filter_size = 2 * int(min_distance) + 1
-    max_filtered = maximum_filter(zscore, size=(1, filter_size, filter_size, filter_size))
-    is_peak = (zscore == max_filtered) & (zscore > float(sigma_threshold))
-    coords = np.array(np.where(is_peak))
-    empty = (np.empty((0, 3), dtype=np.int32), np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32))
+    threshold = float(sigma_threshold)
+
+    def block_peaks(f0: int) -> tuple[np.ndarray, ...]:
+        # z-score, local maximum and threshold one frame block at a time: the
+        # (1, k, k, k) footprint never reaches across frames, so no full-volume
+        # maximum or boolean arrays are needed.
+        z = zscore[f0 : f0 + _FRAME_BLOCK]
+        z -= mean_b
+        z /= std_b
+        local_max = maximum_filter(z, size=(1, filter_size, filter_size, filter_size))
+        frames, *spatial = np.nonzero((z == local_max) & (z > threshold))
+        return (frames + f0, *spatial)
+
     n_frames = int(volume.shape[0])
+    blocks = thread_map(block_peaks, range(0, n_frames, _FRAME_BLOCK))
+    # Blocks are frame-ordered, so this is np.where's C-order result.
+    coords = np.array([np.concatenate(axis) for axis in zip(*blocks)])
+    empty = (np.empty((0, 3), dtype=np.int32), np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32))
     if coords.size == 0:
         return [empty for _ in range(n_frames)]
 
