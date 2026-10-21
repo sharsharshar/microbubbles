@@ -48,6 +48,33 @@ def _gram(matrix: np.ndarray, block: int = _VOXEL_BLOCK) -> np.ndarray:
     return cov
 
 
+def _centered_grams(matrix: np.ndarray, block: int = _VOXEL_BLOCK) -> tuple[np.ndarray, np.ndarray]:
+    """(M M^H, Xc Xc^H) with Xc = M less each voxel's temporal mean, in one pass.
+
+    The centroid needs the Gram of mean-subtracted data. Deriving it as
+    J (M M^H) J subtracts the static (DC) power after the fact, so its rounding
+    grows with (static / fluctuation)^2. Centering is per voxel, hence exact per
+    block, so form Xc Xc^H from centered data instead, and rebuild M M^H from
+    the same blocks: with column means mu, M = Xc + 1 mu^T gives
+    M M^H = Xc Xc^H + w 1^T + 1 w^H + |mu|^2 1 1^T, where w = Xc conj(mu).
+    That keeps one large product per block, as _gram does.
+    """
+    n_frames = int(matrix.shape[0])
+    centered = np.zeros((n_frames, n_frames), dtype=np.complex128)
+    w = np.zeros(n_frames, dtype=np.complex128)
+    mean_power = 0.0
+    for v0 in range(0, matrix.shape[1], block):
+        m = np.asarray(matrix[:, v0 : v0 + block], dtype=np.complex128)
+        mu = m.mean(axis=0)
+        xc = m - mu
+        centered += xc @ xc.conj().T
+        w += xc @ mu.conj()
+        mean_power += float(np.vdot(mu, mu).real)
+    ones = np.ones(n_frames)
+    full = centered + np.outer(w, ones) + np.outer(ones, w.conj()) + mean_power * np.outer(ones, ones)
+    return full, centered
+
+
 def _project(
     matrix: np.ndarray,
     uc: np.ndarray,
@@ -64,16 +91,14 @@ def _project(
     return out
 
 
-def _centroid_cutoff_from_gram(
-    cov: np.ndarray,
+def _centroid_cutoff(
+    centered_gram: np.ndarray,
     frame_rate_hz: float,
     tissue_freq_hz: float,
 ) -> int:
-    n_frames = int(cov.shape[0])
-    # Mean-subtracting each voxel's time series is X = J M with J = I - 11^T/n,
-    # so X X^H = J (M M^H) J: the centered Gram needs no second pass over M.
-    j = np.eye(n_frames) - 1.0 / n_frames
-    evals, u = np.linalg.eigh(j @ cov @ j)
+    """Spectral-centroid cutoff from the Gram matrix of mean-subtracted data."""
+    n_frames = int(centered_gram.shape[0])
+    evals, u = np.linalg.eigh(centered_gram)
     u = u[:, np.argsort(evals)[::-1]]
     abs_freqs = np.abs(np.fft.fftfreq(n_frames, d=1.0 / frame_rate_hz))
     centroid = np.zeros(n_frames)
@@ -112,7 +137,7 @@ def spectral_centroid_cutoff(
     data. Folding powers -- not amplitudes -- also keeps +f and -f Doppler
     from cancelling.
     """
-    return _centroid_cutoff_from_gram(_gram(matrix), frame_rate_hz, tissue_freq_hz)
+    return _centroid_cutoff(_centered_grams(matrix)[1], frame_rate_hz, tissue_freq_hz)
 
 
 def _filter_matrix(
@@ -136,9 +161,9 @@ def _filter_matrix(
                 "re-beamform from a neutral file that records the frame rate (or "
                 "its pulse repetition rate and angle count) in /config."
             )
-        # One Gram matrix serves both the cutoff choice and the projection.
-        cov = _gram(matrix)
-        low = _centroid_cutoff_from_gram(cov, frame_rate_hz, tissue_freq_hz)
+        # One pass yields both the centered Gram (cutoff) and M M^H (projection).
+        cov, centered = _centered_grams(matrix)
+        low = _centroid_cutoff(centered, frame_rate_hz, tissue_freq_hz)
         normalized_method = "fast"
     else:
         low = int(n_components) if n_components is not None else _component_count(low_cutoff, n_frames)
