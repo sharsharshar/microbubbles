@@ -92,7 +92,9 @@ def _normalize_grid_axis(axis: np.ndarray, spatial_shape: tuple[int, int, int]) 
 
 def grid_arrays(h5: h5py.File, acq_id: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     group = h5[f"acquisitions/{acq_id}"]
-    spatial_shape = load_compound(h5, acq_id).shape[1:]
+    # Shape from the dataset header; loading the compound here would re-read ~2 GB.
+    shape = compound_dataset(h5, acq_id).shape
+    spatial_shape = (1, *shape[1:]) if len(shape) == 3 else tuple(shape[1:])
     x_raw = find_dataset(group, ["x"])[()]
     z_raw = find_dataset(group, ["z"])[()]
     try:
