@@ -168,8 +168,12 @@ def detect_batch(
     smoothed = np.asarray(volume, dtype=np.float32)
     if smoothing_sigma > 0:
         smoothed = gaussian_filter(smoothed, sigma=(0, 0, smoothing_sigma, smoothing_sigma))
-    means, stds = _slice_stats(volume, smoothing_sigma)
-    zscore = (smoothed - means[None, :, None, None]) / (stds[None, :, None, None] + 1e-10)
+    # Stats on the already-smoothed volume (sigma 0) rather than smoothing again.
+    means, stds = _slice_stats(smoothed, 0.0)
+    # z-score in place: the smoothed copy is not needed afterwards.
+    zscore = smoothed if smoothed is not volume else smoothed.copy()
+    zscore -= means[None, :, None, None]
+    zscore /= stds[None, :, None, None] + 1e-10
 
     filter_size = 2 * int(min_distance) + 1
     max_filtered = maximum_filter(zscore, size=(1, filter_size, filter_size, filter_size))
@@ -768,10 +772,12 @@ def _run_selected(opts: TrackingOptions, selected: list[int], output_path: Path)
     with open_h5(opts.beamformed_path) as h5:
         for acq_order, acq_id in enumerate(selected):
             compound = load_compound(h5, acq_id)
+            n_frames = int(compound.shape[0])
             if frames_per_acq == 0:
-                frames_per_acq = int(compound.shape[0])
+                frames_per_acq = n_frames
             grid_x, grid_y, grid_z = grid_arrays(h5, acq_id)
             filtered = _filter_acquisition(compound, opts)
+            del compound  # free ~2 GB before detection allocates its own volumes
             batch = detect_batch(
                 filtered,
                 sigma_threshold=opts.sigma_threshold,
@@ -781,7 +787,7 @@ def _run_selected(opts: TrackingOptions, selected: list[int], output_path: Path)
             batch = _knee_filter_batch(batch, opts)
             print(f"[track] acq={acq_id} frames={filtered.shape[0]} shape={filtered.shape[1:]}")
             for frame_in_acq, (pixels, intensities, zscores) in enumerate(batch):
-                global_frame = acq_order * int(compound.shape[0]) + frame_in_acq
+                global_frame = acq_order * n_frames + frame_in_acq
                 if len(pixels) == 0:
                     detections_by_frame.append(np.empty((0, 3), dtype=np.float32))
                     intensities_by_frame.append(np.empty(0, dtype=np.float32))
