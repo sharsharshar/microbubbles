@@ -114,6 +114,13 @@ def add_tracking_args(parser: argparse.ArgumentParser, require_beamformed: bool 
     parser.add_argument("--export-dir", default=None)
     parser.add_argument("--export-stem", default=None)
     parser.add_argument("--min-lengths", type=int, nargs="+", default=[5, 20, 50])
+    parser.add_argument(
+        "--prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Read the next acquisition while the current one is processed "
+        "(holds one extra acquisition in memory).",
+    )
 
 
 def cmd_beamform(args: argparse.Namespace) -> None:

@@ -5,6 +5,7 @@ import os
 import re
 import struct
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
 from math import ceil
@@ -65,6 +66,9 @@ class TrackingOptions:
     export_dir: Path | None = None
     export_stem: str | None = None
     export_min_lengths: tuple[int, ...] = (5, 20, 50)
+    # Read the next acquisition while the current one is processed; holds one
+    # extra compound volume (~2 GB on the reference grid) in memory.
+    prefetch: bool = True
 
 
 def _acq_id_from_path(path: Path) -> int:
@@ -815,13 +819,25 @@ def _run_selected(opts: TrackingOptions, selected: list[int], output_path: Path)
     grid_x = grid_y = grid_z = None
     frames_per_acq = 0
 
-    with open_h5(opts.beamformed_path) as h5:
+    # Context order matters: the reader shuts down (finishing any read in
+    # flight) before the file closes.
+    with open_h5(opts.beamformed_path) as h5, ThreadPoolExecutor(max_workers=1) as reader:
+        pending = None
         for acq_order, acq_id in enumerate(selected):
-            compound = load_compound(h5, acq_id)
+            compound = pending.result() if pending is not None else load_compound(h5, acq_id)
             n_frames = int(compound.shape[0])
             if frames_per_acq == 0:
                 frames_per_acq = n_frames
             grid_x, grid_y, grid_z = grid_arrays(h5, acq_id)
+            # Read the next acquisition while this one is filtered and detected;
+            # h5py releases the GIL during the read. Submitted after grid_arrays
+            # because h5py serializes its own calls behind a single lock.
+            nxt = acq_order + 1
+            pending = (
+                reader.submit(load_compound, h5, selected[nxt])
+                if opts.prefetch and nxt < len(selected)
+                else None
+            )
             filtered = _filter_acquisition(compound, opts)
             del compound  # free ~2 GB before detection allocates its own volumes
             batch = detect_batch(
@@ -1325,4 +1341,5 @@ def make_options(args) -> TrackingOptions:
         export_dir=Path(args.export_dir).expanduser().resolve() if args.export_dir else None,
         export_stem=args.export_stem,
         export_min_lengths=tuple(args.min_lengths),
+        prefetch=getattr(args, "prefetch", True),
     )
