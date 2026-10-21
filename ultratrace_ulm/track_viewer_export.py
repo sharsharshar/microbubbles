@@ -75,8 +75,13 @@ def _grids(data: dict, h5_path: Path | None):
         return grid_arrays(h5, acq)
 
 
-def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=None, svd_cutoff=0.0):
-    """Sample SVD-filtered B-mode magnitude at each track point, normalized to [0, 1]."""
+def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=None, svd_cutoff=0.0,
+                       selected_acq_ids=None):
+    """Sample SVD-filtered B-mode magnitude at each track point, normalized to [0, 1].
+
+    ``selected_acq_ids`` (the tracked acquisitions, in order) maps the global frame
+    index back to its acquisition; without it the last ``pkl_n_acquisitions`` are assumed.
+    """
     grid_x, grid_y, grid_z = grids
     n_elev, n_z, n_x = grid_x.shape
     x_min, x_max = float(grid_x[0, 0, 0]), float(grid_x[0, 0, -1])
@@ -88,7 +93,9 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
     with open_h5(h5_path) as h5:
         all_acq_ids = acq_keys(h5)
         n_h5_acqs = len(all_acq_ids)
-        if pkl_n_acquisitions is not None and pkl_n_acquisitions < n_h5_acqs:
+        if selected_acq_ids:
+            acq_ids = [int(a) for a in selected_acq_ids]
+        elif pkl_n_acquisitions is not None and pkl_n_acquisitions < n_h5_acqs:
             acq_ids = all_acq_ids[-pkl_n_acquisitions:]
         else:
             acq_ids = all_acq_ids
@@ -179,6 +186,7 @@ def export_tracks_bin_v3(
         intensities = lookup_intensities(
             tracks, all_speeds, beamformed, _grids(data, beamformed),
             pkl_n_acquisitions=data.get("n_acquisitions"), svd_cutoff=svd_cutoff,
+            selected_acq_ids=(data.get("params") or {}).get("selected_acq_ids"),
         )
     else:
         intensities = [np.ones(len(s), dtype=np.float32) for s in all_speeds]
