@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
@@ -72,7 +74,17 @@ def spectral_centroid_cutoff(
         if total > 0:
             centroid[i] = float(np.sum(abs_freqs * power) / total)
     above = np.where(centroid > tissue_freq_hz)[0]
-    return int(above[0]) if len(above) else max(1, round(n_frames * 0.1))
+    if len(above):
+        return int(above[0])
+    # Say so once per run: when no centroid reaches the threshold (a 100 Hz
+    # boundary at a 222 Hz frame rate, for example), "adaptive" is the fixed 10%.
+    warnings.warn(
+        f"adaptive SVD: no temporal eigenvector's spectral centroid exceeds "
+        f"{tissue_freq_hz:g} Hz, so the cutoff falls back to 10% of frames",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return max(1, round(n_frames * 0.1))
 
 
 def filter_svd_3d(
