@@ -809,6 +809,9 @@ def _run_selected(opts: TrackingOptions, selected: list[int], output_path: Path)
                 all_zscores.append(zscores)
                 all_frames.append(np.full(len(positions), global_frame, dtype=np.int32))
                 all_acqs.append(np.full(len(positions), int(acq_id), dtype=np.int32))
+            # Free this acquisition's magnitude volume (1 GB on the reference grid)
+            # now; rebinding it later would keep it alive through the next SVD.
+            del filtered, batch
 
     if grid_x is None or grid_y is None or grid_z is None:
         raise RuntimeError("No acquisitions processed")
