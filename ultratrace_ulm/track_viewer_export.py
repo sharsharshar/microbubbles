@@ -21,20 +21,24 @@ no external dependencies beyond numpy and scipy.
 
 from __future__ import annotations
 
+import os
 import shutil
 import struct
 from importlib import resources
 from pathlib import Path
 
+import h5py
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, map_coordinates
 
 from .h5_io import compound_dataset, grid_arrays, acq_keys, open_h5
-from .runtime import load_pickle
+from .runtime import load_pickle, thread_map
 from .svd import filter_svd_3d
 
 MAGIC = 0x554C4D54
 VERSION = 3
+# Concurrent point reads; os.pread releases the GIL, so these overlap their I/O.
+_READ_WORKERS = 16
 
 
 def _track_length(track: dict) -> int:
@@ -75,6 +79,61 @@ def _grids(data: dict, h5_path: Path | None):
         return grid_arrays(h5, acq)
 
 
+def _raw_offset(dset: h5py.Dataset) -> int | None:
+    """File offset of a (frames, elev, z, x) dataset stored as plain C-order
+    little-endian complex64 (contiguous, unfiltered, internal), else None."""
+    if dset.ndim != 4 or dset.dtype != np.dtype("<c8") or dset.chunks is not None or dset.external:
+        return None
+    offset = dset.id.get_offset()
+    return None if offset is None else int(offset)
+
+
+def _interp_bounds(coord: float, n: int) -> tuple[int, int]:
+    """Index range [lo, hi) holding every voxel that order-1, mode="nearest"
+    interpolation at ``coord`` reads, plus a voxel of margin either side.
+
+    The block reaches the array edge exactly where the interpolation clamps, so
+    interpolating on it gives the full-array value. A non-finite coordinate
+    takes the whole axis, leaving whatever map_coordinates does with it unchanged.
+    """
+    if not np.isfinite(coord):
+        return 0, n
+    base = int(np.floor(min(max(coord, 0.0), n - 1.0)))
+    return max(0, base - 1), min(n, base + 3)
+
+
+def _sample_raw(fd: int, offset: int, shape: tuple[int, ...], frame: int, coords: np.ndarray) -> np.float32:
+    """``map_coordinates(|compound[frame]|, coords, order=1, mode="nearest")[0]``
+    computed from only the voxels it reads.
+
+    One ``os.pread`` per elevation plane fetches the needed (z, x) rows, instead
+    of reading the whole acquisition. Coordinates are shifted by the block origin;
+    the shift is exact for whole-number offsets, so the value is bit-identical.
+    """
+    _, n_elev, n_z, n_x = shape
+    (e0, e1), (z0, z1), (x0, x1) = (
+        _interp_bounds(float(c), n) for c, n in zip(coords[:, 0], (n_elev, n_z, n_x))
+    )
+    row_bytes = n_x * 8
+    nbytes = (z1 - z0) * row_bytes
+    block = np.empty((e1 - e0, z1 - z0, x1 - x0), dtype=np.complex64)
+    for i, elev in enumerate(range(e0, e1)):
+        start = offset + ((frame * n_elev + elev) * n_z + z0) * row_bytes
+        raw = os.pread(fd, nbytes, start)
+        if len(raw) != nbytes:
+            raise OSError(f"short read: {len(raw)} of {nbytes} bytes at offset {start}")
+        block[i] = np.frombuffer(raw, dtype="<c8").reshape(z1 - z0, n_x)[:, x0:x1]
+    local = coords - np.array([[e0], [z0], [x0]], dtype=np.float64)
+    return map_coordinates(np.abs(block), local, order=1, mode="nearest")[0]
+
+
+def _sample_raw_points(
+    fd: int, offset: int, shape: tuple[int, ...], points: list[tuple[int, np.ndarray]]
+) -> list[np.float32]:
+    """_sample_raw over (frame, coords) points, with their reads overlapped on threads."""
+    return thread_map(lambda point: _sample_raw(fd, offset, shape, *point), points, max_workers=_READ_WORKERS)
+
+
 def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=None, svd_cutoff=0.0,
                        selected_acq_ids=None):
     """Sample SVD-filtered B-mode magnitude at each track point, normalized to [0, 1].
@@ -90,7 +149,7 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
 
     all_intensities = [np.ones(len(s), dtype=np.float32) for s in all_speeds]
 
-    with open_h5(h5_path) as h5:
+    with open_h5(h5_path) as h5, open(Path(h5_path).expanduser().resolve(), "rb", buffering=0) as raw:
         all_acq_ids = acq_keys(h5)
         n_h5_acqs = len(all_acq_ids)
         if selected_acq_ids:
@@ -126,21 +185,35 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
             if not acq_points:
                 continue
 
-            compound_raw = np.asarray(compound_dataset(h5, acq_id))  # (frames, elev, z, x)
-            if svd_cutoff > 0:
-                # Stable full SVD: the covariance ("fast") variant is numerically
-                # unstable in float32 and not reproducible across backends.
-                compound = np.abs(filter_svd_3d(compound_raw, low_cutoff=svd_cutoff, method="full"))
-            else:
-                compound = np.abs(compound_raw)
-
+            points = []
             for ti, pi, gframe, x_mm, y_mm, z_mm in acq_points:
-                fia = gframe - acq_start
                 x_idx = (x_mm - x_min) / (x_max - x_min) * (n_x - 1) if n_x > 1 else 0.0
                 elev_idx = (y_mm - y_min) / (y_max - y_min) * (n_elev - 1) if n_elev > 1 else 0.0
                 z_idx = (z_mm - z_min) / (z_max - z_min) * (n_z - 1) if n_z > 1 else 0.0
-                coords = np.array([[elev_idx], [z_idx], [x_idx]])
-                all_intensities[ti][pi] = map_coordinates(compound[fia], coords, order=1, mode="nearest")[0]
+                points.append((ti, pi, gframe - acq_start, np.array([[elev_idx], [z_idx], [x_idx]])))
+
+            dset = compound_dataset(h5, acq_id)  # (frames, elev, z, x)
+            offset = None if svd_cutoff > 0 else _raw_offset(dset)
+            if offset is not None:
+                # Raw magnitude needs only a few voxels per point, not the whole
+                # acquisition (~2 GB each, so a full pass re-reads the entire file).
+                values = _sample_raw_points(
+                    raw.fileno(), offset, dset.shape, [(fia, coords) for _, _, fia, coords in points]
+                )
+            else:
+                compound_raw = np.asarray(dset)
+                if svd_cutoff > 0:
+                    # Stable full SVD: the covariance ("fast") variant is numerically
+                    # unstable in float32 and not reproducible across backends.
+                    compound = np.abs(filter_svd_3d(compound_raw, low_cutoff=svd_cutoff, method="full"))
+                else:
+                    compound = np.abs(compound_raw)
+                values = [
+                    map_coordinates(compound[fia], coords, order=1, mode="nearest")[0]
+                    for _, _, fia, coords in points
+                ]
+            for (ti, pi, _, _), value in zip(points, values):
+                all_intensities[ti][pi] = value
 
     all_vals = np.concatenate(all_intensities)
     p1, p99 = np.percentile(all_vals, [1, 99])
