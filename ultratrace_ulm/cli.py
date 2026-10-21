@@ -16,6 +16,13 @@ from .launcher_export import parse_viewer_spec, write_launcher
 from .volume_export import export_svd_volume, make_options as make_volume_options
 
 
+PREFETCH_HELP = (
+    "Read the next acquisition while the current one is processed (holds one extra "
+    "acquisition in memory). No effect with --output-per-acq, which tracks one "
+    "acquisition per pass."
+)
+
+
 def add_beamform_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", required=True, help="Input raw ultratrace.")
     parser.add_argument("--output", required=True, help="Output beamformed ultratrace.")
@@ -118,8 +125,7 @@ def add_tracking_args(parser: argparse.ArgumentParser, require_beamformed: bool 
         "--prefetch",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Read the next acquisition while the current one is processed "
-        "(holds one extra acquisition in memory).",
+        help=PREFETCH_HELP,
     )
 
 
@@ -228,6 +234,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         export_dir=str(work),
         export_stem="tracks",
         min_lengths=list(args.export_min_lengths),
+        prefetch=args.prefetch,
     )
     smoothed = run_tracking_outputs(make_tracking_options(track_ns))
 
@@ -343,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--acq-step", type=int, default=1)
     p.add_argument("--all-acqs", action="store_true", help="Beamform every acquisition.")
     p.add_argument("--force", action="store_true", help="Re-run stages whose outputs exist.")
+    p.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True, help=PREFETCH_HELP)
     p.add_argument(
         "--downloader",
         choices=("auto", "aria2", "urllib"),
