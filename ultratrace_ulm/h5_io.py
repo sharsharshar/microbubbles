@@ -70,7 +70,8 @@ def _to_mm(values: np.ndarray) -> np.ndarray:
 
 
 def _normalize_grid_axis(axis: np.ndarray, spatial_shape: tuple[int, int, int]) -> np.ndarray:
-    axis = np.squeeze(_to_mm(axis))
+    # A single-plane axis squeezes to 0-d; keep it 1-d so it broadcasts below.
+    axis = np.atleast_1d(np.squeeze(_to_mm(axis)))
     elev, z, x = spatial_shape
 
     if axis.shape == spatial_shape:
