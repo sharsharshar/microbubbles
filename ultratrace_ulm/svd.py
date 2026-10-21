@@ -202,6 +202,9 @@ def _filter_matrix(
         return _project(matrix, u[:, low:stop], magnitude)
     elif normalized_method == "full":
         m = np.asarray(matrix, dtype=np.complex128)
+        if not np.isfinite(m).all():
+            # LAPACK's complex SVD never returns on input containing Inf.
+            raise ValueError("method='full' needs finite data; the compound contains NaN or Inf")
         u, s, vh = np.linalg.svd(m, full_matrices=False)
         s[:low] = 0
         if high_remove > 0:
