@@ -77,16 +77,22 @@ def _centered_grams(matrix: np.ndarray, block: int = _VOXEL_BLOCK) -> tuple[np.n
 
 def _project(
     matrix: np.ndarray,
-    uc: np.ndarray,
+    basis: np.ndarray,
     magnitude: bool,
+    complement: bool = False,
     block: int = _VOXEL_BLOCK,
 ) -> np.ndarray:
-    """uc uc^H M per voxel block, rounded to complex64 (or its float32 magnitude)."""
+    """Per voxel block, basis basis^H M (or M - basis basis^H M with ``complement``),
+    rounded to complex64 or to its float32 magnitude."""
     out = np.empty(matrix.shape, dtype=np.float32 if magnitude else np.complex64)
-    uch = uc.conj().T
+    basis_h = basis.conj().T
     for v0 in range(0, matrix.shape[1], block):
         m = np.asarray(matrix[:, v0 : v0 + block], dtype=np.complex128)
-        filtered = (uc @ (uch @ m)).astype(np.complex64)
+        projected = basis @ (basis_h @ m)
+        if complement:
+            # Into ``projected``, not ``m``: m may be a view of complex128 input.
+            np.subtract(m, projected, out=projected)
+        filtered = projected.astype(np.complex64)
         out[:, v0 : v0 + block] = np.abs(filtered) if magnitude else filtered
     return out
 
@@ -187,8 +193,13 @@ def _filter_matrix(
         evals, u = np.linalg.eigh(cov)
         u = u[:, np.argsort(evals)[::-1]]
         stop = n_frames - high_remove if high_remove > 0 else n_frames
-        uc = u[:, low:stop]
-        return _project(matrix, uc, magnitude)
+        removed = np.concatenate([u[:, :low], u[:, stop:]], axis=1)
+        if removed.shape[1] < stop - low:
+            # u is a complete orthonormal basis, so keeping components low:stop
+            # is the same projection as subtracting the rest, M - Ur Ur^H M, and
+            # the removed side is the small one (24 of 240 on the reference data).
+            return _project(matrix, removed, magnitude, complement=True)
+        return _project(matrix, u[:, low:stop], magnitude)
     elif normalized_method == "full":
         m = np.asarray(matrix, dtype=np.complex128)
         u, s, vh = np.linalg.svd(m, full_matrices=False)
