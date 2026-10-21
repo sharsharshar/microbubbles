@@ -170,8 +170,10 @@ def detect_batch(
         smoothed = gaussian_filter(smoothed, sigma=(0, 0, smoothing_sigma, smoothing_sigma))
     # Stats on the already-smoothed volume (sigma 0) rather than smoothing again.
     means, stds = _slice_stats(smoothed, 0.0)
-    # z-score in place: the smoothed copy is not needed afterwards.
-    zscore = smoothed if smoothed is not volume else smoothed.copy()
+    # z-score in place: the smoothed copy is not needed afterwards. np.asarray
+    # can return a view of the caller's memory (memmap, masked array, other
+    # subclasses, __array__ objects), so test for sharing, not identity.
+    zscore = smoothed.copy() if np.may_share_memory(smoothed, volume) else smoothed
     zscore -= means[None, :, None, None]
     zscore /= stds[None, :, None, None] + 1e-10
 
