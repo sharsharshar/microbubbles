@@ -252,14 +252,16 @@ def lookup_intensities(tracks, all_speeds, h5_path, grids, pkl_n_acquisitions=No
             for (ti, pi, _, _), value in zip(points, values):
                 all_intensities[ti][pi] = value
 
+    return _normalize_intensities(all_intensities)
+
+
+def _normalize_intensities(all_intensities: list[np.ndarray]) -> list[np.ndarray]:
+    """Scale per-point values to [0, 1] between their 1st and 99th percentiles."""
     all_vals = np.concatenate(all_intensities)
     p1, p99 = np.percentile(all_vals, [1, 99])
     if p99 > p1:
-        for i in range(len(all_intensities)):
-            all_intensities[i] = np.clip((all_intensities[i] - p1) / (p99 - p1), 0.0, 1.0).astype(np.float32)
-    else:
-        all_intensities = [np.ones_like(a) for a in all_intensities]
-    return all_intensities
+        return [np.clip((a - p1) / (p99 - p1), 0.0, 1.0).astype(np.float32) for a in all_intensities]
+    return [np.ones_like(a, dtype=np.float32) for a in all_intensities]
 
 
 def export_tracks_bin_v3(
@@ -298,6 +300,10 @@ def export_tracks_bin_v3(
             pkl_n_acquisitions=data.get("n_acquisitions"), svd_cutoff=svd_cutoff,
             selected_acq_ids=(data.get("params") or {}).get("selected_acq_ids"),
         )
+    elif all("intensities" in t and len(t["intensities"]) == len(s) for t, s in zip(tracks, all_speeds)):
+        # No beamformed file: use the tracker's own per-detection magnitude
+        # (the SVD-filtered peak value), normalized like lookup_intensities.
+        intensities = _normalize_intensities([np.asarray(t["intensities"], dtype=np.float32) for t in tracks])
     else:
         intensities = [np.ones(len(s), dtype=np.float32) for s in all_speeds]
 

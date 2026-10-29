@@ -59,6 +59,7 @@ uniform float u_speedBand;
 uniform float u_reveal;
 uniform float u_edge;
 uniform int u_useIntensity;
+uniform int u_sizeByIntensity;
 
 varying float vSpeed;
 varying float vIntensity;
@@ -98,8 +99,10 @@ void main() {
   float dist = -mvPosition.z;
   float size = u_pointSize * u_pixelRatio * (300.0 / max(dist, 1.0));
 
-  if (u_useIntensity == 1) {
-    size *= aIntensity;
+  // Bright detections draw larger: dense vessels fill in as tubes, dim
+  // scattered points stay as fine dots. A floor keeps every point visible.
+  if (u_sizeByIntensity == 1) {
+    size *= 0.35 + 0.9 * aIntensity;
   }
   size *= (1.0 + 1.6 * vGlow);
 
@@ -118,6 +121,7 @@ varying float vGlow;
 uniform float u_maxSpeed;
 uniform int u_colormap;
 uniform int u_useIntensity;
+uniform float u_opacity;
 
 vec3 cmapJet(float t) {
   t = clamp(t, 0.0, 1.0);
@@ -192,9 +196,11 @@ void main() {
     t = vSpeed / max(u_maxSpeed, 0.001);
   }
   vec3 color = applyColormap(t);
-  color = mix(color, vec3(1.0), 0.7 * vGlow);
-
-  gl_FragColor = vec4(color, 1.0);
+  color = mix(color, vec3(1.0), 0.35 * vGlow);
+  // Soft-edged disc: overlapping points along a vessel blend into a tube
+  // instead of a chain of hard circles.
+  float alpha = u_opacity * smoothstep(1.0, 0.25, r2);
+  gl_FragColor = vec4(color * alpha, alpha);
 }
 `;
 
@@ -315,6 +321,8 @@ class TrackSystem {
       u_speedFilter: { value: -1.0 },
       u_speedBand: { value: 0.08 },
       u_useIntensity: { value: 0 },
+      u_sizeByIntensity: { value: 1 },
+      u_opacity: { value: 0.85 },
       u_reveal: { value: 0.0 },
       u_edge: { value: 0.04 },
     };
@@ -325,7 +333,10 @@ class TrackSystem {
       uniforms: this.uniforms,
       transparent: true,
       depthWrite: false,
-      blending: THREE.NormalBlending,
+      // Premultiplied alpha: the shader already scales colour by alpha.
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor,
+      blendDst: THREE.OneMinusSrcAlphaFactor,
     });
 
     this.points = new THREE.Points(geometry, material);
@@ -339,8 +350,19 @@ class TrackSystem {
     return this.points;
   }
 
-  update(dt, speedMultiplier) {
+  update(dt, speedMultiplier, buildUp, opacity) {
     this.uniforms.u_time.value += dt;
+    if (!buildUp) {
+      // Whole map at once, fading in over ~2 s from the moment build-up is off.
+      this.fade = Math.min((this.fade ?? 0) + dt / 2.0, 1.0);
+      this.uniforms.u_reveal.value = 1.0;
+      this.uniforms.u_edge.value = 0.0;
+      this.uniforms.u_opacity.value = opacity * this.fade;
+      return;
+    }
+    this.fade = 0.0;
+    this.uniforms.u_edge.value = 0.04;
+    this.uniforms.u_opacity.value = opacity;
     // speedMultiplier ("frames/s") drives how fast the map builds; 240 ~= 1 s.
     const rate = Math.max(speedMultiplier, 1.0) / 240.0;
     this.reveal += dt * rate;
@@ -349,7 +371,8 @@ class TrackSystem {
     this.uniforms.u_reveal.value = Math.min(this.reveal, 1.0);
   }
 
-  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity }) {
+  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity, sizeByIntensity }) {
+    if (sizeByIntensity !== undefined) this.uniforms.u_sizeByIntensity.value = sizeByIntensity ? 1 : 0;
     if (pointSize !== undefined) this.uniforms.u_pointSize.value = pointSize;
     if (maxSpeed !== undefined) this.uniforms.u_maxSpeed.value = maxSpeed;
     if (colormap !== undefined) this.uniforms.u_colormap.value = colormap;
@@ -364,17 +387,20 @@ class TrackSystem {
 // App
 // ============================================================
 
+const COLORMAPS = { Jet: 0, Inferno: 1, Viridis: 2, Plasma: 3, Coolwarm: 4, Hot: 5, Turbo: 6 };
+
 const params = {
-  speedMultiplier: 20.0,
-  pointSize: 0.3762,
-  maxSpeed: 0.1713,
-  colormap: 0,       // Jet
+  buildUp: false,    // show the whole map at once; true replays the acquisition
+  speedMultiplier: 60.0,
+  pointSize: 0.3,
+  maxSpeed: 0.1713,  // mm per frame; 38 mm/s at 222 Hz, the top of the colour scale
+  colormap: 3,       // Plasma: slow purple -> fast orange
+  opacity: 0.85,
   jitter: 0.0,
   speedFilter: 0.0,
   particlesPerTrack: 40,
-  // Speed coloring by default: bundles built without --beamformed carry a
-  // constant intensity of 1.0, which intensity mode paints as all-red.
-  useIntensity: false,
+  colorBy: "speed",
+  sizeByIntensity: true,
   paused: false,
 };
 
@@ -414,7 +440,8 @@ function applyParams() {
     jitter: params.jitter,
     speedFilter: params.speedFilter,
     maxSpeedData: trackData ? trackData.maxSpeed : 1.0,
-    useIntensity: params.useIntensity,
+    useIntensity: params.colorBy === "intensity",
+    sizeByIntensity: params.sizeByIntensity,
   });
 }
 
@@ -448,11 +475,17 @@ async function init() {
     );
     orbitControls.update();
 
-    // GUI: only Speed and Speed Filter
     const gui = new GUI({ title: "Brane" });
-    gui.add(params, "speedMultiplier", 1, 240).name("Speed (frames/s)").onChange(applyParams);
+    gui.add(params, "buildUp").name("Build up over time");
+    gui.add(params, "speedMultiplier", 1, 240).name("Build speed (frames/s)");
+    gui.add(params, "colorBy", ["speed", "intensity"]).name("Color by").onChange(applyParams);
+    gui.add(params, "colormap", COLORMAPS).name("Colormap").onChange(applyParams);
+    gui.add(params, "maxSpeed", 0.02, 0.5).name("Speed scale top (mm/frame)").onChange(applyParams);
+    gui.add(params, "pointSize", 0.05, 1.5).name("Point size").onChange(applyParams);
+    gui.add(params, "sizeByIntensity").name("Size by intensity").onChange(applyParams);
+    gui.add(params, "opacity", 0.1, 1.0).name("Opacity");
     const maxSpd = trackData.maxSpeed;
-    gui.add(params, "speedFilter", 0, maxSpd).name("Speed Filter").onChange(applyParams);
+    gui.add(params, "speedFilter", 0, maxSpd).name("Speed filter").onChange(applyParams);
 
     applyParams();
     info.textContent = `${trackData.nTracks.toLocaleString()} tracks | drag to orbit`;
@@ -469,7 +502,7 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.05);
   orbitControls.update();
   if (trackSystem && !params.paused) {
-    trackSystem.update(dt, params.speedMultiplier);
+    trackSystem.update(dt, params.speedMultiplier, params.buildUp, params.opacity);
   }
   composer.render();
 }
