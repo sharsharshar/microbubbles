@@ -102,7 +102,8 @@ void main() {
   vPulse = 0.0;
   if (u_flow == 1) {
     float p = fract(aPhase * u_bubbles - u_time * u_flowRate + aOffset);
-    vPulse = smoothstep(0.18, 0.0, p);
+    // Narrow head, short tail: a dot moving along the vessel, not a bead chain.
+    vPulse = smoothstep(0.06, 0.0, p);
   }
 
   float seed = aRandom * 6.2831;
@@ -124,7 +125,7 @@ void main() {
     size *= 0.55 + 0.7 * aIntensity;
   }
   size *= (1.0 + 1.6 * vGlow);
-  size *= (1.0 + 1.4 * vPulse);
+  size *= (1.0 + 0.4 * vPulse);
 
   gl_PointSize = size;
   gl_Position = projectionMatrix * mvPosition;
@@ -221,8 +222,9 @@ void main() {
   vec3 color = applyColormap(t);
   color = mix(color, vec3(1.0), 0.35 * vGlow);
   if (u_flow == 1) {
-    color *= mix(u_tubeDim, 1.0, vPulse);
-    color = mix(color, vec3(1.0), 0.25 * vPulse);
+    // Vessel keeps its hue at u_tubeDim; the head is the same hue, brighter.
+    color *= mix(u_tubeDim, 1.6, vPulse);
+    color = min(color, vec3(1.0));
   }
   // Soft-edged disc: overlapping points along a vessel blend into a tube
   // instead of a chain of hard circles.
@@ -357,10 +359,10 @@ class TrackSystem {
       u_useIntensity: { value: 0 },
       u_sizeByIntensity: { value: 1 },
       u_maxPixels: { value: 6.0 },
-      u_flow: { value: 1 },
-      u_flowRate: { value: 0.5 },
-      u_bubbles: { value: 2.0 },
-      u_tubeDim: { value: 0.55 },
+      u_flow: { value: 0 },
+      u_flowRate: { value: 0.35 },
+      u_bubbles: { value: 1.0 },
+      u_tubeDim: { value: 0.7 },
       u_opacity: { value: 1.0 },
       u_reveal: { value: 0.0 },
       u_edge: { value: 0.04 },
@@ -447,10 +449,10 @@ const params = {
   particlesPerTrack: 40,
   colorBy: "speed",
   sizeByIntensity: true,
-  flow: true,        // bubbles sliding along each vessel in the recorded direction
-  flowRate: 0.5,     // track lengths per second
-  bubbles: 2,        // heads per track
-  tubeDim: 0.55,     // brightness of the static vessel under the moving heads
+  flow: false,       // opt-in: one bright head per vessel moving in the recorded direction
+  flowRate: 0.35,    // track lengths per second
+  bubbles: 1,        // heads per track
+  tubeDim: 0.7,      // brightness of the static vessel under the moving heads
   paused: false,
 };
 
