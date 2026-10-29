@@ -372,7 +372,9 @@ const params = {
   jitter: 0.0,
   speedFilter: 0.0,
   particlesPerTrack: 40,
-  useIntensity: true,
+  // Speed coloring by default: bundles built without --beamformed carry a
+  // constant intensity of 1.0, which intensity mode paints as all-red.
+  useIntensity: false,
   paused: false,
 };
 

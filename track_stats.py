@@ -40,10 +40,13 @@ def summarize(data: dict, min_length: int, flow_mm: float) -> dict:
         [float(np.sum(np.linalg.norm(np.diff(t["positions"], axis=0), axis=1))) for t in tracks],
         dtype=np.float64,
     )
+    # Elapsed time between the first and last localization: the path length is
+    # measured over the same interval, so the inclusive (+1) count would bias
+    # short tracks slow (a 5-frame track by 20 percent).
     duration_s = np.array(
-        [(int(t["frames"][-1]) - int(t["frames"][0]) + 1) / frame_rate if frame_rate else np.nan for t in tracks]
+        [(int(t["frames"][-1]) - int(t["frames"][0])) / frame_rate if frame_rate else np.nan for t in tracks]
     )
-    mean_speed = np.where(duration_s > 0, path_len / duration_s, np.nan)
+    mean_speed = np.where(duration_s > 0, path_len / np.where(duration_s > 0, duration_s, 1.0), np.nan)
     flowing = net >= flow_mm
     # Straightness (net / path length) separates directed bubble motion from
     # random-walk links between noise detections, which my flow threshold alone

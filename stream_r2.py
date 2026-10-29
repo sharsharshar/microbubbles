@@ -6,8 +6,10 @@ byte range. This wraps the URL in a seekable file object that serves h5py
 through parallel HTTP range requests, then patches ``open_h5`` so the normal
 CLI (``track``, ``volume``, ...) reads the remote file as if it were local.
 
-    uv run stream_r2.py selftest
-    uv run stream_r2.py track --beamformed R2 --tracks out/tracks.pkl --num-acqs 2 ...
+    uv run --with requests python stream_r2.py selftest
+    uv run --with requests python stream_r2.py track --beamformed R2 --tracks out/tracks.pkl --num-acqs 2 ...
+
+``requests`` is not a project dependency, hence ``--with requests``.
 
 Pass the literal path ``R2`` (or the file's basename) wherever the CLI wants
 the beamformed file. Only read paths are patched: ``track-viewer --beamformed``
@@ -79,13 +81,22 @@ class HttpRangeFile(io.RawIOBase):
         last: Exception | None = None
         for _ in range(RETRIES):
             try:
-                resp = self._session().get(self.url, headers=headers, timeout=TIMEOUT)
-                if resp.status_code == 206 and len(resp.content) == end - start:
-                    with self._lock:
-                        self.bytes_fetched += end - start
-                        self.requests_made += 1
-                    return resp.content
-                last = OSError(f"HTTP {resp.status_code}, {len(resp.content)} bytes for {headers['Range']}")
+                # stream=True: a 200 (If-Range mismatch, or a server ignoring Range)
+                # would otherwise read the whole 445 GB object into memory.
+                with self._session().get(self.url, headers=headers, timeout=TIMEOUT, stream=True) as resp:
+                    if resp.status_code == 200:
+                        raise OSError("server answered 200 instead of 206: remote file changed or Range ignored")
+                    length = int(resp.headers.get("Content-Length") or -1)
+                    if resp.status_code == 206 and length == end - start:
+                        data = resp.content
+                        if len(data) == end - start:
+                            with self._lock:
+                                self.bytes_fetched += end - start
+                                self.requests_made += 1
+                            return data
+                        last = OSError(f"short body {len(data)} of {end - start} for {headers['Range']}")
+                    else:
+                        last = OSError(f"HTTP {resp.status_code}, Content-Length {length} for {headers['Range']}")
             except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as exc:
                 last = exc
             time.sleep(delay)
@@ -161,18 +172,29 @@ class HttpRangeFile(io.RawIOBase):
     def close(self) -> None:
         if not self.closed:
             self._pool.shutdown(wait=False)
+            with self._lock:
+                self._cache.clear()
         super().close()
 
 
-_OPEN: list[HttpRangeFile] = []
+class RemoteH5(h5py.File):
+    """h5py.File that closes its HTTP reader (and the reader's pool) with the file."""
+
+    def __init__(self, reader: HttpRangeFile) -> None:
+        self._reader = reader
+        super().__init__(reader, "r")
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._reader.close()
 
 
 def open_h5_patched(path) -> h5py.File:
     name = Path(str(path)).name
     if name in REMOTE_NAMES and not Path(str(path)).exists():
-        f = HttpRangeFile()
-        _OPEN.append(f)
-        return h5py.File(f, "r")
+        return RemoteH5(HttpRangeFile())
     return h5py.File(Path(path).expanduser().resolve(), "r")
 
 
