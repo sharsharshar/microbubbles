@@ -36,6 +36,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import GUI from "lil-gui";
 
 // ============================================================
@@ -60,6 +61,7 @@ uniform float u_reveal;
 uniform float u_edge;
 uniform int u_useIntensity;
 uniform int u_sizeByIntensity;
+uniform float u_maxPixels;
 
 varying float vSpeed;
 varying float vIntensity;
@@ -98,11 +100,13 @@ void main() {
   vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
   float dist = -mvPosition.z;
   float size = u_pointSize * u_pixelRatio * (300.0 / max(dist, 1.0));
+  // Cap in device pixels: zooming in should separate points, not swell them.
+  size = min(size, u_maxPixels * u_pixelRatio);
 
   // Bright detections draw larger: dense vessels fill in as tubes, dim
   // scattered points stay as fine dots. A floor keeps every point visible.
   if (u_sizeByIntensity == 1) {
-    size *= 0.35 + 0.9 * aIntensity;
+    size *= 0.55 + 0.7 * aIntensity;
   }
   size *= (1.0 + 1.6 * vGlow);
 
@@ -147,9 +151,9 @@ vec3 cmapViridis(float t) {
 
 vec3 cmapPlasma(float t) {
   t = clamp(t, 0.0, 1.0);
-  if (t < 0.33) return mix(vec3(0.05, 0.03, 0.53), vec3(0.56, 0.07, 0.55), t / 0.33);
-  if (t < 0.66) return mix(vec3(0.56, 0.07, 0.55), vec3(0.92, 0.42, 0.18), (t - 0.33) / 0.33);
-  return mix(vec3(0.92, 0.42, 0.18), vec3(0.94, 0.97, 0.13), (t - 0.66) / 0.34);
+  if (t < 0.33) return mix(vec3(0.25, 0.30, 0.95), vec3(0.70, 0.15, 0.75), t / 0.33);
+  if (t < 0.66) return mix(vec3(0.70, 0.15, 0.75), vec3(0.98, 0.50, 0.15), (t - 0.33) / 0.33);
+  return mix(vec3(0.98, 0.50, 0.15), vec3(1.0, 0.78, 0.40), (t - 0.66) / 0.34);
 }
 
 vec3 cmapCoolwarm(float t) {
@@ -322,7 +326,8 @@ class TrackSystem {
       u_speedBand: { value: 0.08 },
       u_useIntensity: { value: 0 },
       u_sizeByIntensity: { value: 1 },
-      u_opacity: { value: 0.85 },
+      u_maxPixels: { value: 5.0 },
+      u_opacity: { value: 1.0 },
       u_reveal: { value: 0.0 },
       u_edge: { value: 0.04 },
     };
@@ -371,8 +376,9 @@ class TrackSystem {
     this.uniforms.u_reveal.value = Math.min(this.reveal, 1.0);
   }
 
-  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity, sizeByIntensity }) {
+  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity, sizeByIntensity, maxPixels }) {
     if (sizeByIntensity !== undefined) this.uniforms.u_sizeByIntensity.value = sizeByIntensity ? 1 : 0;
+    if (maxPixels !== undefined) this.uniforms.u_maxPixels.value = maxPixels;
     if (pointSize !== undefined) this.uniforms.u_pointSize.value = pointSize;
     if (maxSpeed !== undefined) this.uniforms.u_maxSpeed.value = maxSpeed;
     if (colormap !== undefined) this.uniforms.u_colormap.value = colormap;
@@ -392,10 +398,12 @@ const COLORMAPS = { Jet: 0, Inferno: 1, Viridis: 2, Plasma: 3, Coolwarm: 4, Hot:
 const params = {
   buildUp: false,    // show the whole map at once; true replays the acquisition
   speedMultiplier: 60.0,
-  pointSize: 0.3,
+  pointSize: 0.45,
+  maxPixels: 6,
+  bloom: 0.25,
   maxSpeed: 0.1713,  // mm per frame; 38 mm/s at 222 Hz, the top of the colour scale
-  colormap: 3,       // Plasma: slow purple -> fast orange
-  opacity: 0.85,
+  colormap: 6,       // Turbo: ordered blue -> red, bright across the whole range
+  opacity: 1.0,
   jitter: 0.0,
   speedFilter: 0.0,
   particlesPerTrack: 40,
@@ -407,6 +415,7 @@ const params = {
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(window.devicePixelRatio);
+renderer.toneMapping = THREE.NoToneMapping;
 renderer.setClearColor(0x010104);
 document.body.appendChild(renderer.domElement);
 
@@ -423,6 +432,12 @@ orbitControls.update();
 
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
+// Bloom gives dense vessels the glow of Aleph's renders; threshold low so dim
+// slow-flow points still contribute a halo.
+const bloomPass = new UnrealBloomPass(
+  new THREE.Vector2(window.innerWidth, window.innerHeight), 0.25, 0.3, 0.7
+);
+composer.addPass(bloomPass);
 composer.addPass(new OutputPass());
 
 const info = document.getElementById("info");
@@ -442,6 +457,7 @@ function applyParams() {
     maxSpeedData: trackData ? trackData.maxSpeed : 1.0,
     useIntensity: params.colorBy === "intensity",
     sizeByIntensity: params.sizeByIntensity,
+    maxPixels: params.maxPixels,
   });
 }
 
@@ -470,7 +486,7 @@ async function init() {
     orbitControls.target.copy(center);
     camera.position.set(
       center.x,
-      center.y + Math.max(size.x, size.z) * 1.2,
+      center.y + Math.max(size.x, size.z) * 0.75,
       center.z
     );
     orbitControls.update();
@@ -482,8 +498,10 @@ async function init() {
     gui.add(params, "colormap", COLORMAPS).name("Colormap").onChange(applyParams);
     gui.add(params, "maxSpeed", 0.02, 0.5).name("Speed scale top (mm/frame)").onChange(applyParams);
     gui.add(params, "pointSize", 0.05, 1.5).name("Point size").onChange(applyParams);
+    gui.add(params, "maxPixels", 1, 20).name("Max point px").onChange(applyParams);
     gui.add(params, "sizeByIntensity").name("Size by intensity").onChange(applyParams);
-    gui.add(params, "opacity", 0.1, 1.0).name("Opacity");
+    gui.add(params, "opacity", 0.05, 1.0).name("Opacity");
+    gui.add(params, "bloom", 0.0, 2.5).name("Bloom").onChange((v) => { bloomPass.strength = v; });
     const maxSpd = trackData.maxSpeed;
     gui.add(params, "speedFilter", 0, maxSpd).name("Speed filter").onChange(applyParams);
 
