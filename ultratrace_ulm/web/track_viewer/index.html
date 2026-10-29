@@ -50,6 +50,8 @@ attribute float aSpeed;
 attribute float aIntensity;
 attribute float aRandom;
 attribute float aFrame;
+attribute float aPhase;   // 0..1 along the point's own track, in frame order
+attribute float aOffset;  // per-track phase offset so bubbles do not march in step
 
 uniform float u_pointSize;
 uniform float u_pixelRatio;
@@ -62,10 +64,14 @@ uniform float u_edge;
 uniform int u_useIntensity;
 uniform int u_sizeByIntensity;
 uniform float u_maxPixels;
+uniform int u_flow;
+uniform float u_flowRate;
+uniform float u_bubbles;
 
 varying float vSpeed;
 varying float vIntensity;
 varying float vGlow;
+varying float vPulse;
 
 void main() {
   vSpeed = aSpeed;
@@ -90,6 +96,15 @@ void main() {
   // Bright, slightly larger moving front at the leading edge of the reveal.
   vGlow = u_edge > 0.0 ? clamp(1.0 - (u_reveal - aFrame) / u_edge, 0.0, 1.0) : 0.0;
 
+  // Flow: a bright head that slides along the track toward later frames, the
+  // direction the bubble was recorded moving. The static points stay as the
+  // vessel; the heads are the blood. u_bubbles heads per track.
+  vPulse = 0.0;
+  if (u_flow == 1) {
+    float p = fract(aPhase * u_bubbles - u_time * u_flowRate + aOffset);
+    vPulse = smoothstep(0.18, 0.0, p);
+  }
+
   float seed = aRandom * 6.2831;
   vec3 pos = position + u_jitter * vec3(
     sin(seed * 13.7 + u_time * 2.1),
@@ -109,6 +124,7 @@ void main() {
     size *= 0.55 + 0.7 * aIntensity;
   }
   size *= (1.0 + 1.6 * vGlow);
+  size *= (1.0 + 1.4 * vPulse);
 
   gl_PointSize = size;
   gl_Position = projectionMatrix * mvPosition;
@@ -126,6 +142,9 @@ uniform float u_maxSpeed;
 uniform int u_colormap;
 uniform int u_useIntensity;
 uniform float u_opacity;
+uniform int u_flow;
+uniform float u_tubeDim;
+varying float vPulse;
 
 vec3 cmapJet(float t) {
   t = clamp(t, 0.0, 1.0);
@@ -201,6 +220,10 @@ void main() {
   }
   vec3 color = applyColormap(t);
   color = mix(color, vec3(1.0), 0.35 * vGlow);
+  if (u_flow == 1) {
+    color *= mix(u_tubeDim, 1.0, vPulse);
+    color = mix(color, vec3(1.0), 0.25 * vPulse);
+  }
   // Soft-edged disc: overlapping points along a vessel blend into a tube
   // instead of a chain of hard circles.
   float alpha = u_opacity * smoothstep(1.0, 0.25, r2);
@@ -290,13 +313,18 @@ class TrackSystem {
     const intensities = new Float32Array(totalPoints);
     const randoms = new Float32Array(totalPoints);
     const frames = new Float32Array(totalPoints);
+    const phases = new Float32Array(totalPoints);
+    const offsets = new Float32Array(totalPoints);
 
     let k = 0;
     for (let i = 0; i < nTracks; i++) {
       const off = tracks[i].pointOffset * fpp;
       const len = tracks[i].length;
+      const trackOffset = Math.random();
       for (let j = 0; j < len; j++) {
         const b = off + j * fpp;
+        phases[k] = len > 1 ? j / (len - 1) : 0.0;
+        offsets[k] = trackOffset;
         positions[k * 3] = pointData[b];
         positions[k * 3 + 1] = pointData[b + 1];
         positions[k * 3 + 2] = pointData[b + 2];
@@ -314,6 +342,8 @@ class TrackSystem {
     geometry.setAttribute("aIntensity", new THREE.BufferAttribute(intensities, 1));
     geometry.setAttribute("aRandom", new THREE.BufferAttribute(randoms, 1));
     geometry.setAttribute("aFrame", new THREE.BufferAttribute(frames, 1));
+    geometry.setAttribute("aPhase", new THREE.BufferAttribute(phases, 1));
+    geometry.setAttribute("aOffset", new THREE.BufferAttribute(offsets, 1));
 
     this.uniforms = {
       u_pointSize: { value: 0.3 },
@@ -326,7 +356,11 @@ class TrackSystem {
       u_speedBand: { value: 0.08 },
       u_useIntensity: { value: 0 },
       u_sizeByIntensity: { value: 1 },
-      u_maxPixels: { value: 5.0 },
+      u_maxPixels: { value: 6.0 },
+      u_flow: { value: 1 },
+      u_flowRate: { value: 0.5 },
+      u_bubbles: { value: 2.0 },
+      u_tubeDim: { value: 0.55 },
       u_opacity: { value: 1.0 },
       u_reveal: { value: 0.0 },
       u_edge: { value: 0.04 },
@@ -376,7 +410,11 @@ class TrackSystem {
     this.uniforms.u_reveal.value = Math.min(this.reveal, 1.0);
   }
 
-  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity, sizeByIntensity, maxPixels }) {
+  setRenderParams({ pointSize, maxSpeed, colormap, jitter, speedFilter, maxSpeedData, useIntensity, sizeByIntensity, maxPixels, flow, flowRate, bubbles, tubeDim }) {
+    if (flow !== undefined) this.uniforms.u_flow.value = flow ? 1 : 0;
+    if (flowRate !== undefined) this.uniforms.u_flowRate.value = flowRate;
+    if (bubbles !== undefined) this.uniforms.u_bubbles.value = bubbles;
+    if (tubeDim !== undefined) this.uniforms.u_tubeDim.value = tubeDim;
     if (sizeByIntensity !== undefined) this.uniforms.u_sizeByIntensity.value = sizeByIntensity ? 1 : 0;
     if (maxPixels !== undefined) this.uniforms.u_maxPixels.value = maxPixels;
     if (pointSize !== undefined) this.uniforms.u_pointSize.value = pointSize;
@@ -409,6 +447,10 @@ const params = {
   particlesPerTrack: 40,
   colorBy: "speed",
   sizeByIntensity: true,
+  flow: true,        // bubbles sliding along each vessel in the recorded direction
+  flowRate: 0.5,     // track lengths per second
+  bubbles: 2,        // heads per track
+  tubeDim: 0.55,     // brightness of the static vessel under the moving heads
   paused: false,
 };
 
@@ -458,6 +500,10 @@ function applyParams() {
     useIntensity: params.colorBy === "intensity",
     sizeByIntensity: params.sizeByIntensity,
     maxPixels: params.maxPixels,
+    flow: params.flow,
+    flowRate: params.flowRate,
+    bubbles: params.bubbles,
+    tubeDim: params.tubeDim,
   });
 }
 
@@ -492,6 +538,11 @@ async function init() {
     orbitControls.update();
 
     const gui = new GUI({ title: "Brane" });
+    const flow = gui.addFolder("Flow");
+    flow.add(params, "flow").name("Bubbles along vessels").onChange(applyParams);
+    flow.add(params, "flowRate", 0.05, 3).name("Flow rate (tracks/s)").onChange(applyParams);
+    flow.add(params, "bubbles", 1, 6, 1).name("Bubbles per track").onChange(applyParams);
+    flow.add(params, "tubeDim", 0.0, 1.0).name("Vessel brightness").onChange(applyParams);
     gui.add(params, "buildUp").name("Build up over time");
     gui.add(params, "speedMultiplier", 1, 240).name("Build speed (frames/s)");
     gui.add(params, "colorBy", ["speed", "intensity"]).name("Color by").onChange(applyParams);
