@@ -54,6 +54,17 @@ Already have a beamformed file? Skip download and beamforming:
 ultratrace-ulm run --beamformed beamformed.h5 --frame-rate 222
 ```
 
+The beamformed sample (all 216 acquisitions, ~445 GB) is also hosted, so the
+pipeline can run without a GPU. The downloader resumes after dropped
+connections and checks free disk space first:
+
+```bash
+uv run download_beamformed_reference.py      # writes beamformed_reference_216acq.h5
+ultratrace-ulm run --beamformed beamformed_reference_216acq.h5
+```
+
+The frame rate (222.43 Hz) is read from the file.
+
 > `run` downloads ~96 GB and beamforms on a CUDA GPU. To avoid both, pass
 > `--beamformed`. For full control over any stage, use the dedicated
 > subcommands below instead.
@@ -139,6 +150,18 @@ ultratrace-ulm track \
 
 Writes `outputs/tracks.pkl` and a smoothed `outputs/tracks_smoothed.pkl`. Add
 `--export-dir`/`--min-lengths` (or use `track-export`) to also emit `.bin` files.
+
+On the beamformed sample (240 frames of 25 x 154 x 275 voxels per
+acquisition), tracking all 216 acquisitions took 1.9 h on a 16-core laptop CPU
+(Intel Core Ultra 7 255H), about 32 s per acquisition, with a 5.9 GB memory
+peak. `track` reads the next acquisition while filtering the current one;
+`--no-prefetch` turns that off. On six acquisitions that lowered the peak from
+5.9 to 3.9 GB and ran about 20% slower.
+
+Tracks are linked across acquisition boundaries as if the acquisitions were
+recorded back to back. The file does not record the time between them. On the
+sample, 480 of 49,950 tracks cross a boundary. `--output-per-acq` tracks each
+acquisition separately (without prefetch).
 
 #### Recommended recipe
 
