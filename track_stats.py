@@ -45,6 +45,10 @@ def summarize(data: dict, min_length: int, flow_mm: float) -> dict:
     )
     mean_speed = np.where(duration_s > 0, path_len / duration_s, np.nan)
     flowing = net >= flow_mm
+    # Straightness (net / path length) separates directed bubble motion from
+    # random-walk links between noise detections, which my flow threshold alone
+    # cannot: a 5-frame noise chain can also wander 0.5 mm within the gate.
+    straight = np.where(path_len > 0, net / np.maximum(path_len, 1e-9), 0.0)
     cross = np.array([int(t["frames"][0]) // frames_per_acq != int(t["frames"][-1]) // frames_per_acq for t in tracks])
     per_acq = np.bincount(starts, minlength=n_acq)
     per_acq_flowing = np.bincount(starts[flowing], minlength=n_acq)
@@ -66,6 +70,8 @@ def summarize(data: dict, min_length: int, flow_mm: float) -> dict:
         "flowing_fraction": float(flowing.mean()) if len(tracks) else 0.0,
         "flowing_tracks_per_acq_mean": float(per_acq_flowing.mean()),
         "cross_boundary_tracks": int(cross.sum()),
+        "straightness_median": float(np.median(straight)) if len(tracks) else 0.0,
+        "straight_fraction": float((straight >= 0.8).mean()) if len(tracks) else 0.0,
         "length_median": float(np.median(lengths)) if len(tracks) else 0.0,
         "length_mean": float(lengths.mean()) if len(tracks) else 0.0,
         "net_displacement_mm_median": float(np.median(net)) if len(tracks) else 0.0,
@@ -94,6 +100,7 @@ def main() -> None:
             f"flowing(>={args.flow_mm}mm)={100 * s['flowing_fraction']:.0f}%  "
             f"len med={s['length_median']:.0f}  net disp med={s['net_displacement_mm_median']:.2f}mm  "
             f"speed med={s['mean_speed_mm_s_median']:.1f} p90={s['mean_speed_mm_s_p90']:.1f} mm/s  "
+            f"straight med={s['straightness_median']:.2f} (>=0.8: {100 * s['straight_fraction']:.0f}%)  "
             f"cross-acq={s['cross_boundary_tracks']}"
         )
     s5 = out[str(args.min_length[0])]
